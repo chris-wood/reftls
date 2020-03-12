@@ -28,11 +28,19 @@ reduc forall sk:dh_priv, n:nonce;
 type domain.
 fun cert(domain): bitstring [data].
 
+type flag.
+const flag_true, flag_false: flag.
+
 free io:channel.
 
 (* ECHO Model *)
 event ECHOClientDone(domain,pubkey,nonce).
 event ECHOServerDone(domain,pubkey,nonce).
+event ECHOClientFallbackDone(domain,pubkey,bitstring).
+event ECHOServerFallbackDone(domain,pubkey,bitstring).
+event Reachable(bitstring).
+event ServerFallbackReachable(bitstring).
+event ClientFallbackReachable(bitstring).
 
 (* TODO: introduce public parameters and private parameters *)
 
@@ -67,38 +75,80 @@ let ClientECHO(frontend:domain,pk_frontend:pubkey,origin:domain) =
      (* ClientHelloOuter *)
      new x_outer:dh_priv;
      let gx_outer = exp(x_outer) in
-     let ch_outer = (gx_outer, frontend, echo) in
+     let ch_outer = (gx_outer, frontend, pk_frontend, echo) in
 
      out (io,ch_outer);
-     in (io,(gy:bitstring,ecert:bitstring));
-     let gxy = dh_dec(x_inner,gy) in
+     in (io,(gy:bitstring,echo_used:flag,ecert:bitstring));
+     if echo_used = flag_true then (
+        (* ECHO accept *)
+        let gxy = dh_dec(x_inner,gy) in
+        let k_inner = kdf(gxy,(hpke_nonce,ch_inner)) in
+        let cert_origin = sym_dec(k_inner,ecert) in
+        if validate_cert(origin,cert_origin) then
+        event ECHOClientDone(origin,pk_frontend,hpke_nonce))
+      else (
+        (* ECHO reject *)
+        event ClientFallbackReachable(ch_outer);
 
-     let k = kdf(gxy,(hpke_nonce,ch_inner)) in
-
-     let cert_origin = sym_dec(k,ecert) in
-     if validate_cert(origin,cert_origin) then
-     event ECHOClientDone(origin,pk_frontend,hpke_nonce).
+        let gxy = dh_dec(x_outer,gy) in
+        let k_outer = kdf(gxy,ch_outer) in
+        let cert_origin = sym_dec(k_outer,ecert) in
+        if validate_cert(frontend,cert_origin) then
+        event ECHOClientFallbackDone(frontend,pk_frontend,ch_outer)).
 
 let ServerECHO(frontend:domain,sk_frontend:privkey) =
-     in (io,ch:bitstring);
-     let (gx:dh_pub,=frontend,echo:bitstring) = ch in
-     let ch_inner = pke_dec(sk_frontend,echo) in
-     let (gx_inner:dh_pub,origin:domain,hpke_nonce:nonce) = ch_inner in
+     in (io,ch_outer:bitstring);
+     let (gx_outer:dh_pub,=frontend,pk_frontend:pubkey,echo:bitstring) = ch_outer in
 
-     (* TODO: validate nonce *)
+     if pk_frontend = pk(sk_frontend) then (
+      let ch_inner = pke_dec(sk_frontend,echo) in
+      let (gx_inner:dh_pub,origin:domain,hpke_nonce:nonce) = ch_inner in
 
-     let cert_origin = get_cert(origin) in
-     new gxy:nonce;
-     let gy = dh_enc(gx_inner,gxy) in
+       (*
+          TODO: validate nonce per the following rules.
 
-     let k = kdf(gxy,(hpke_nonce,ch_inner)) in
+          If decryption fails, the server MUST abort the connection with
+          a "decrypt_error" alert. Moreover, if there is no "echo_nonce"
+          extension, or if its value does not match the derived echo_nonce,
+          the server MUST abort the connection with a "decrypt_error" alert.
+          Next, the server MUST scan ClientHelloInner for any "outer_extension"
+          extensions and substitute their values with the values in ClientHelloOuter.
+          It MUST first verify that the hash found in the extension matches the hash
+          of the extension to be interpolated in and if it does not, abort the connections
+          with a "decrypt_error" alert.
+       *)
 
-     let sh = gy in
-     let ecert = sym_enc(k,cert_origin) in
-     event ECHOServerDone(origin,pk(sk_frontend),hpke_nonce);
-     out (io,(gy,ecert)).
+       let cert_origin = get_cert(origin) in
+       new gxy:nonce;
+       let gy = dh_enc(gx_inner,gxy) in
 
-query h:domain, p:pubkey, n:nonce;
+       let k = kdf(gxy,(hpke_nonce,ch_inner)) in
+
+       let sh = gy in
+       let ecert = sym_enc(k,cert_origin) in
+       event ECHOServerDone(origin,pk(sk_frontend),hpke_nonce);
+       out (io,(gy,flag_true,ecert)))
+
+      else (
+
+        (* Fallback to public name and CHOuter *)
+        let cert_origin = get_cert(frontend) in
+        new gxy:nonce;
+        let gy = dh_enc(gx_outer,gxy) in
+
+        let k = kdf(gxy,ch_outer) in
+
+        event ServerFallbackReachable(ch_outer);
+
+        let sh = gy in
+        let ecert = sym_enc(k,cert_origin) in
+        event ECHOServerFallbackDone(frontend,pk(sk_frontend),ch_outer);
+        out (io,(gy,flag_false,ecert))).
+
+
+query h:domain, p:pubkey, n:nonce, ch:bitstring;
+      event(ServerFallbackReachable(ch));
+      event(ClientFallbackReachable(ch));
       event(ECHOClientDone(F,p,n));
       event(ECHOClientDone(A,p,n));
       event(ECHOClientDone(B,p,n));
@@ -106,14 +156,18 @@ query h:domain, p:pubkey, n:nonce;
       event(ECHOServerDone(F,p,n));
       event(ECHOServerDone(A,p,n));
       event(ECHOServerDone(B,p,n));
-      event(ECHOServerDone(chosen_sni,p,n)).
-
+      event(ECHOServerDone(chosen_sni,p,n));
+      event(ECHOServerFallbackDone(F,p,ch));
+      event(ECHOClientFallbackDone(F,p,ch)).
 
 process
   new skF:privkey;
+  new skA:privkey;
   let pkF = pk(skF) in
+  let pkA = pk(skA) in
     !ClientECHO(F,pkF,A)
   | !ClientECHO(F,pkF,B)
   | !ClientECHO(F,pkF,F)
   | !ClientECHO(F,pkF,chosen_sni)
   | !ServerECHO(F,skF)
+  | !ServerECHO(F,skA) (* server with an old key *)
