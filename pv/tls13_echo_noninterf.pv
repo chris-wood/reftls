@@ -1,0 +1,119 @@
+(* Library Functions and Types *)
+type pubkey.
+type privkey.
+fun pk(privkey):pubkey.
+fun pke_enc(pubkey,bitstring):bitstring.
+fun pke_dec(privkey,bitstring):bitstring
+reduc forall sk:privkey, b:bitstring;
+      pke_dec(sk,pke_enc(pk(sk),b)) = b.
+
+type symkey.
+fun sym_enc(symkey,bitstring):bitstring.
+fun sym_dec(symkey,bitstring):bitstring
+reduc forall k:symkey, b:bitstring;
+      sym_dec(k,sym_enc(k,b)) = b.
+
+type nonce.
+fun kdf(nonce,bitstring): symkey.
+
+type dh_pub.
+type dh_priv.
+fun exp(dh_priv):dh_pub.
+fun dh_enc(dh_pub,nonce):bitstring.
+fun dh_dec(dh_priv,bitstring):nonce
+reduc forall sk:dh_priv, n:nonce;
+      dh_dec(sk,dh_enc(exp(sk),n)) = n.
+
+
+type domain.
+fun cert(domain): bitstring [data].
+
+free io:channel.
+
+(* ECHO Model *)
+event ECHOClientDone(domain,pubkey,nonce).
+event ECHOServerDone(domain,pubkey,nonce).
+
+(* TODO: introduce public parameters and private parameters *)
+
+const A: domain.
+const B: domain.
+const F: domain.
+
+free chosen_sni:domain [private].
+noninterf chosen_sni among (A,B,F).
+
+(* Parametric "sni-independent" processing of sni at the server *)
+letfun get_cert(sni:domain) = cert(sni).
+(* Using the following instead would break noninterf of sni
+   because of the comparisons:
+       if sni = A then cert(A)
+       else if sni = B then cert(B)
+       else cert(F).
+*)
+
+letfun validate_cert(d:domain,c:bitstring) = c = cert(d).
+
+let ClientECHO(frontend:domain,pk_frontend:pubkey,origin:domain) =
+     (* ClientHelloInner *)
+     new x_inner:dh_priv;
+     let gx_inner = exp(x_inner) in
+     new hpke_nonce:nonce; (* hpke extract output *)
+     let ch_inner = (gx_inner, origin, hpke_nonce) in
+
+     (* ECHO *)
+     let echo = pke_enc(pk_frontend,ch_inner) in
+
+     (* ClientHelloOuter *)
+     new x_outer:dh_priv;
+     let gx_outer = exp(x_outer) in
+     let ch_outer = (gx_outer, frontend, echo) in
+
+     out (io,ch_outer);
+     in (io,(gy:bitstring,ecert:bitstring));
+     let gxy = dh_dec(x_inner,gy) in
+
+     let k = kdf(gxy,(hpke_nonce,ch_inner)) in
+
+     let cert_origin = sym_dec(k,ecert) in
+     if validate_cert(origin,cert_origin) then
+     event ECHOClientDone(origin,pk_frontend,hpke_nonce).
+
+let ServerECHO(frontend:domain,sk_frontend:privkey) =
+     in (io,ch:bitstring);
+     let (gx:dh_pub,=frontend,echo:bitstring) = ch in
+     let ch_inner = pke_dec(sk_frontend,echo) in
+     let (gx_inner:dh_pub,origin:domain,hpke_nonce:nonce) = ch_inner in
+
+     (* TODO: validate nonce *)
+
+     let cert_origin = get_cert(origin) in
+     new gxy:nonce;
+     let gy = dh_enc(gx_inner,gxy) in
+
+     let k = kdf(gxy,(hpke_nonce,ch_inner)) in
+
+     let sh = gy in
+     let ecert = sym_enc(k,cert_origin) in
+     event ECHOServerDone(origin,pk(sk_frontend),hpke_nonce);
+     out (io,(gy,ecert)).
+
+query h:domain, p:pubkey, n:nonce;
+      event(ECHOClientDone(F,p,n));
+      event(ECHOClientDone(A,p,n));
+      event(ECHOClientDone(B,p,n));
+      event(ECHOClientDone(chosen_sni,p,n));
+      event(ECHOServerDone(F,p,n));
+      event(ECHOServerDone(A,p,n));
+      event(ECHOServerDone(B,p,n));
+      event(ECHOServerDone(chosen_sni,p,n)).
+
+
+process
+  new skF:privkey;
+  let pkF = pk(skF) in
+    !ClientECHO(F,pkF,A)
+  | !ClientECHO(F,pkF,B)
+  | !ClientECHO(F,pkF,F)
+  | !ClientECHO(F,pkF,chosen_sni)
+  | !ServerECHO(F,skF)
