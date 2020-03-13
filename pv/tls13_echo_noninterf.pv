@@ -62,6 +62,23 @@ letfun get_cert(sni:domain) = cert(sni).
 
 letfun validate_cert(d:domain,c:bitstring) = c = cert(d).
 
+let ClientECHOAccept(frontend:domain,pk_frontend:pubkey,origin:domain, x_inner:dh_priv, hpke_nonce:nonce, ch_inner:bitstring, sh:bitstring) =
+  let (gy:bitstring,echo_used:flag,ecert:bitstring) = sh in
+  let gxy = dh_dec(x_inner,gy) in
+  let k_inner = kdf(gxy,(hpke_nonce,ch_inner)) in
+  let cert_origin = sym_dec(k_inner,ecert) in
+  if validate_cert(origin,cert_origin) then
+  event ECHOClientDone(origin,pk_frontend,hpke_nonce).
+
+let ClientECHOReject(frontend:domain,pk_frontend:pubkey,origin:domain, x_outer:dh_priv, ch_outer:bitstring, sh:bitstring) =
+  let (gy:bitstring,echo_used:flag,ecert:bitstring) = sh in
+  event ClientFallbackReachable(ch_outer);
+  let gxy = dh_dec(x_outer,gy) in
+  let k_outer = kdf(gxy,ch_outer) in
+  let cert_origin = sym_dec(k_outer,ecert) in
+  if validate_cert(frontend,cert_origin) then
+  event ECHOClientFallbackDone(frontend,pk_frontend,ch_outer).
+
 let ClientECHO(frontend:domain,pk_frontend:pubkey,origin:domain) =
      (* ClientHelloInner *)
      new x_inner:dh_priv;
@@ -78,23 +95,15 @@ let ClientECHO(frontend:domain,pk_frontend:pubkey,origin:domain) =
      let ch_outer = (gx_outer, frontend, pk_frontend, echo) in
 
      out (io,ch_outer);
-     in (io,(gy:bitstring,echo_used:flag,ecert:bitstring));
+     in (io, sh:bitstring);
+
+     let (gy:bitstring,echo_used:flag,ecert:bitstring) = sh in
      if echo_used = flag_true then (
         (* ECHO accept *)
-        let gxy = dh_dec(x_inner,gy) in
-        let k_inner = kdf(gxy,(hpke_nonce,ch_inner)) in
-        let cert_origin = sym_dec(k_inner,ecert) in
-        if validate_cert(origin,cert_origin) then
-        event ECHOClientDone(origin,pk_frontend,hpke_nonce))
+        ClientECHOAccept(frontend, pk_frontend, origin, x_inner, hpke_nonce, ch_inner, sh))
       else (
         (* ECHO reject *)
-        event ClientFallbackReachable(ch_outer);
-
-        let gxy = dh_dec(x_outer,gy) in
-        let k_outer = kdf(gxy,ch_outer) in
-        let cert_origin = sym_dec(k_outer,ecert) in
-        if validate_cert(frontend,cert_origin) then
-        event ECHOClientFallbackDone(frontend,pk_frontend,ch_outer)).
+        ClientECHOReject(frontend, pk_frontend, origin, x_outer, ch_outer, sh)).
 
 let ServerECHO(frontend:domain,sk_frontend:privkey) =
      in (io,ch_outer:bitstring);
