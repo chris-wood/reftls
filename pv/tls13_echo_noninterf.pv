@@ -1,3 +1,6 @@
+(* TODO(caw): summarize the model details here *)
+(* ../../proverif2.00/proverif tls13_echo_noninterf.pv | grep RESULT *)
+
 (* Library Functions and Types *)
 type pubkey.
 type privkey.
@@ -24,6 +27,97 @@ fun dh_dec(dh_priv,bitstring):nonce
 reduc forall sk:dh_priv, n:nonce;
       dh_dec(sk,dh_enc(exp(sk),n)) = n.
 
+(* TODO(caw): consider moving to a separate library *)
+
+(********************************************************)
+(* Authenticated Encryption with Additional Data *)
+(* extended with with weak/strong algorithms: See Lucky13, Beast, RC4 *)
+(********************************************************)
+
+type ae_alg.
+const WeakAE, StrongAE: ae_alg.
+type ae_key.
+fun b2ae(bitstring):ae_key [data].
+
+fun aead_enc(ae_alg, ae_key, bitstring, bitstring, bitstring): bitstring.
+fun aead_forged(bitstring,bitstring): bitstring.
+
+fun aead_dec(ae_alg, ae_key, bitstring, bitstring, bitstring): bitstring
+reduc forall a:ae_alg, k:ae_key, n:bitstring, p:bitstring, ad:bitstring;
+    aead_dec(a, k, n, ad, aead_enc(a, k, n, ad, p)) = p
+otherwise forall a:ae_alg, k:ae_key, n:bitstring, p:bitstring, ad:bitstring,p':bitstring,ad':bitstring;
+    aead_dec(WeakAE, k, n, ad, aead_forged(p,aead_enc(WeakAE, k, n, ad', p'))) = p.
+
+fun aead_leak(bitstring):bitstring
+reduc forall k:ae_key, n:bitstring, ad:bitstring, x:bitstring;
+      aead_leak(aead_enc(WeakAE,k,n,ad,x)) = x.
+
+(********************************************************)
+(* Diffie-Hellman with small/bad subgroup attacks. See Logjam, Cross-Protocol *)
+(********************************************************)
+
+type group.
+const StrongDH: group [data].
+const WeakDH: group [data].
+
+type element.
+fun e2b(element): bitstring [data].
+const BadElement: element [data].
+const G: element [data].
+
+fun dh_ideal(element,bitstring):element.
+equation forall x:bitstring, y:bitstring;
+   dh_ideal(dh_ideal(G,x),y) =
+   dh_ideal(dh_ideal(G,y),x).
+
+fun dh_exp(group,element,bitstring):element
+reduc forall g:group, e:element, x:bitstring;
+      dh_exp(WeakDH,e,x) = BadElement
+otherwise forall g:group, e:element, x:bitstring;
+      dh_exp(StrongDH,BadElement,x) = BadElement
+otherwise forall g:group, e:element, x:bitstring;
+      dh_exp(StrongDH,e,x) = dh_ideal(e,x).
+
+letfun dh_keygen(g:group) =
+       new x:bitstring;
+       let gx = dh_exp(g,G,x) in
+       (x,gx).
+
+
+(*
+let g = StrongDH in
+
+- SetupSender(pkR): generate (x, gx, zz)
+let (x:bitstring,gx:element) = dh_keygen(g) in
+let zz_input = e2b(dh_exp(g,pkR,x)) in
+let zz = hkdf_extract(zero,zz_input) in
+
+- SetupReceiver(pkS, skR): generate (zz)
+let zz_input = e2b(dh_exp(g,pkS,sk_frontend)) in
+let zz = hkdf_extract(zero,zz_input) in
+
+- Export: generate nonce (from zz)
+let nonce = hkdf_expand_label(zz,echo_nonce,zero) in
+
+- Seal(MSG): generate key/IV from zz, and encrypt
+let aek = hkdf_expand_label(zz,echo_key,zero) in
+let aeiv = hkdf_expand_label(zz,echo_iv,zero) in
+let encrypted_ch = aead_enc(StrongAE,b2ae(aek),aeiv,MSG,zero) in
+
+- Open(CT): generate key/IV from zz, and decrypt
+let aek = hkdf_expand_label(zz,echo_key,zero) in
+let aeiv = hkdf_expand_label(zz,echo_iv,zero) in
+let MSG = aead_dec(StrongAE,b2ae(aek),aeiv,CT,zero) in
+
+// End-to-end code
+let g = StrongDH in
+let (x:bitstring,gx:element) = dh_keygen(g) in
+let gcs = e2b(dh_exp(g,gs,c)) in
+let kcs = hkdf_extract(zero,gcs) in
+let aek = hkdf_expand_label(kcs,tls13_esni_key,random2b(cr)) in
+let aeiv = hkdf_expand_label(kcs,tls13_esni_iv,random2b(cr)) in
+let enc_sni = aead_enc(StrongAE,b2ae(aek),aeiv,(e2b(gx),tkt),(sni_nonce,sni)) in
+*)
 
 type domain.
 fun cert(domain): bitstring [data].
@@ -68,7 +162,7 @@ let ClientECHOAccept(frontend:domain,pk_frontend:pubkey,origin:domain, x_inner:d
   let k_inner = kdf(gxy,(hpke_nonce,ch_inner)) in
   let cert_origin = sym_dec(k_inner,ecert) in
   if validate_cert(origin,cert_origin) then
-  event ECHOClientDone(origin,pk_frontend,hpke_nonce).
+    event ECHOClientDone(origin,pk_frontend,hpke_nonce).
 
 let ClientECHOReject(frontend:domain,pk_frontend:pubkey,origin:domain, x_outer:dh_priv, ch_outer:bitstring, sh:bitstring) =
   let (gy:bitstring,echo_used:flag,ecert:bitstring) = sh in
@@ -77,13 +171,14 @@ let ClientECHOReject(frontend:domain,pk_frontend:pubkey,origin:domain, x_outer:d
   let k_outer = kdf(gxy,ch_outer) in
   let cert_origin = sym_dec(k_outer,ecert) in
   if validate_cert(frontend,cert_origin) then
-  event ECHOClientFallbackDone(frontend,pk_frontend,ch_outer).
+    event ECHOClientFallbackDone(frontend,pk_frontend,ch_outer).
 
 let ClientECHO(frontend:domain,pk_frontend:pubkey,origin:domain) =
      (* ClientHelloInner *)
      new x_inner:dh_priv;
      let gx_inner = exp(x_inner) in
      new hpke_nonce:nonce; (* hpke extract output *)
+
      let ch_inner = (gx_inner, origin, hpke_nonce) in
 
      (* ECHO *)
@@ -94,16 +189,18 @@ let ClientECHO(frontend:domain,pk_frontend:pubkey,origin:domain) =
      let gx_outer = exp(x_outer) in
      let ch_outer = (gx_outer, frontend, pk_frontend, echo) in
 
+     (* Read a SH or HRR from the server *)
      out (io,ch_outer);
      in (io, sh:bitstring);
 
      let (gy:bitstring,echo_used:flag,ecert:bitstring) = sh in
+     (* No retry -- process as a server hello *)
      if echo_used = flag_true then (
-        (* ECHO accept *)
-        ClientECHOAccept(frontend, pk_frontend, origin, x_inner, hpke_nonce, ch_inner, sh))
-      else (
-        (* ECHO reject *)
-        ClientECHOReject(frontend, pk_frontend, origin, x_outer, ch_outer, sh)).
+       (* ECHO accept *)
+       ClientECHOAccept(frontend, pk_frontend, origin, x_inner, hpke_nonce, ch_inner, sh))
+     else (
+       (* ECHO reject *)
+       ClientECHOReject(frontend, pk_frontend, origin, x_outer, ch_outer, sh)).
 
 let ServerECHO(frontend:domain,sk_frontend:privkey) =
      in (io,ch_outer:bitstring);
