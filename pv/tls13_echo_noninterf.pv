@@ -90,7 +90,7 @@ letfun hpke_export(e:element, l:label) =
   hkdf_expand_label(e2b(e),l,zero).
 
 (********************************************************)
-(* Helper types)
+(* Helper types *)
 (********************************************************)
 type domain.
 fun cert(domain): bitstring [data].
@@ -98,6 +98,12 @@ fun cert(domain): bitstring [data].
 const A: domain.
 const B: domain.
 const F: domain.
+
+(********************************************************)
+(* TLS helper types *)
+(********************************************************)
+type message_type.
+const CH1, CH2, SH, HRR: message_type.
 
 (********************************************************)
 (* ECHO events *)
@@ -149,75 +155,77 @@ let ClientECHO(frontend:domain,pkR:element,origin:domain) =
   let ch_outer = (gx_outer, frontend, pkR, ge, echo) in
 
   (* Read a SH (or HRR) from the server *)
-  out (io,ch_outer);
-  in (io, sh:bitstring);
+  out (io,(CH1,ch_outer));
+  in (io, (=SH,sh:bitstring));
 
-  (* First, assume the inner CH was used *)
+  (* Handle the SH case first *)
   let (gy:element,ecert:bitstring) = sh in
-  let gxy_inner = dh_exp(g,gy,x_inner) in
-  let k_inner = b2k(hkdf_extract(ch_inner,e2b(gxy_inner))) in
+    let gxy_inner = dh_exp(g,gy,x_inner) in
+    let k_inner = b2k(hkdf_extract((CH1,SH,ch_inner),e2b(gxy_inner))) in
 
-  let cert_origin = sym_dec(k_inner,ecert) in (
-    event ClientInnerReachable;
-    if validate_cert(origin,cert_origin) then
-      (* ECHO accept with cert match *)
-      event ECHOClientDone(origin,pkR,ch_inner,hpke_nonce)
-    else (
-      (* ECHO accept with cert mismatch -- configuration error *)
-      event ClientInnerMismatchReachable;
-      event ECHOClientAcceptWithMismatch(ch_inner,hpke_nonce)))
-  else
-    (* Otherwise, assume the outer CH was used *)
-    let gxy_outer = dh_exp(g,gy,x_outer) in
-    let k_outer = b2k(hkdf_extract(ch_outer,e2b(gxy_outer))) in
-    let cert_frontend = sym_dec(k_outer,ecert) in
+    let cert_origin = sym_dec(k_inner,ecert) in (
+      event ClientInnerReachable;
+      if validate_cert(origin,cert_origin) then
+        (* ECHO accept with cert match *)
+        event ECHOClientDone(origin,pkR,ch_inner,hpke_nonce)
+      else (
+        (* ECHO accept with cert mismatch -- configuration error *)
+        event ClientInnerMismatchReachable;
+        event ECHOClientAcceptWithMismatch(ch_inner,hpke_nonce)))
+    else
+      (* Otherwise, assume the outer CH was used *)
+      let gxy_outer = dh_exp(g,gy,x_outer) in
+      let k_outer = b2k(hkdf_extract((CH1,SH,ch_outer),e2b(gxy_outer))) in
+      let cert_frontend = sym_dec(k_outer,ecert) in
 
-    if validate_cert(frontend,cert_frontend) then (
-      (* ECHO reject *)
-      event ClientOuterReachable;
-      event ECHOClientFallbackDone(frontend,pkR,ch_outer))
-    else (
-      event ClientOuterUnreachable).
+      if validate_cert(frontend,cert_frontend) then (
+        (* ECHO reject *)
+        event ClientOuterReachable;
+        event ECHOClientFallbackDone(frontend,pkR,ch_outer))
+      else (
+        event ClientOuterUnreachable).
 
 let ServerECHO(frontend:domain,skR:bitstring) =
-     in (io,ch_outer:bitstring);
-     let (gx_outer:element,=frontend,target_pk:element,ge:element,echo:bitstring) = ch_outer in
+  in (io,(=CH1,ch_outer:bitstring));
+  let (gx_outer:element,=frontend,target_pk:element,ge:element,echo:bitstring) = ch_outer in
 
-     let g = StrongDH in
-     let pkR = dh_exp(g,G,skR) in
-     if target_pk = pkR then (
-       let geR = dh_exp(g,ge,skR) in
-       let hpke_nonce = hpke_export(geR,nonce_label) in
-       let echo_zz = b2k(hkdf_extract(zero,e2b(geR))) in
-       let ch_inner = sym_dec(echo_zz,echo) in
+  let g = StrongDH in
+  let pkR = dh_exp(g,G,skR) in
+  if target_pk = pkR then (
+   let geR = dh_exp(g,ge,skR) in
+   let hpke_nonce = hpke_export(geR,nonce_label) in
+   let echo_zz = b2k(hkdf_extract(zero,e2b(geR))) in
+   let ch_inner = sym_dec(echo_zz,echo) in
 
-       let (gx_inner:element,origin:domain,=hpke_nonce) = ch_inner in
+   let (gx_inner:element,origin:domain,=hpke_nonce) = ch_inner in
 
-       let cert_origin = get_cert(origin) in
+   let cert_origin = get_cert(origin) in
 
-       event ServerSuccessReachable(ch_inner);
+   event ServerSuccessReachable(ch_inner);
 
-       let (y:bitstring,gy:element) = dh_keygen(g) in
-       let gxy_inner = dh_exp(g,gx_inner,y) in
-       let k_inner = b2k(hkdf_extract(ch_inner,e2b(gxy_inner))) in
-       let ecert = sym_enc(k_inner,cert_origin) in
+   let (y:bitstring,gy:element) = dh_keygen(g) in
+   let gxy_inner = dh_exp(g,gx_inner,y) in
+   let k_inner = b2k(hkdf_extract((CH1,SH,ch_inner),e2b(gxy_inner))) in
+   let ecert = sym_enc(k_inner,cert_origin) in
 
-       event ECHOServerDone(origin,pkR,ch_inner,hpke_nonce);
-       out (io,(gy,ecert)))
+   event ECHOServerDone(origin,pkR,ch_inner,hpke_nonce);
+   let sh = (gy,ecert) in
+   out (io,(SH, sh)))
 
-      else (
-        (* Fallback to public name and CHOuter *)
-        let cert_frontend = get_cert(frontend) in
+  else (
+    (* Fallback to public name and CHOuter *)
+    let cert_frontend = get_cert(frontend) in
 
-        let (y:bitstring,gy:element) = dh_keygen(g) in
-        let gxy_outer = dh_exp(g,gx_outer,y) in
-        let k_outer = b2k(hkdf_extract(ch_outer,e2b(gxy_outer))) in
+    let (y:bitstring,gy:element) = dh_keygen(g) in
+    let gxy_outer = dh_exp(g,gx_outer,y) in
+    let k_outer = b2k(hkdf_extract((CH1,SH,ch_outer),e2b(gxy_outer))) in
 
-        event ServerFallbackReachable(ch_outer);
+    event ServerFallbackReachable(ch_outer);
 
-        let ecert = sym_enc(k_outer,cert_frontend) in
-        event ECHOServerFallbackDone(frontend,pkR,ch_outer);
-        out (io,(gy,ecert))).
+    let ecert = sym_enc(k_outer,cert_frontend) in
+    event ECHOServerFallbackDone(frontend,pkR,ch_outer);
+    let sh = (gy,ecert) in
+    out (io,(SH, sh))).
 
 (********************************************************)
 (* Queries *)
