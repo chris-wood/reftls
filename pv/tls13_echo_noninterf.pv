@@ -223,7 +223,6 @@ let ServerECHO(frontend:domain,skR:bitstring,should_retry:flag) =
     else (
       (* Fallback to public name and CHOuter *)
       let cert_frontend = get_cert(frontend) in
-
       let (y:bitstring,gy:element) = dh_keygen(g) in
       let gxy_outer = dh_exp(g,gx_outer,y) in
       let k_outer = b2k(hkdf_extract((CH1,SH,ch_outer),e2b(gxy_outer))) in

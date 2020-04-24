@@ -143,16 +143,42 @@ letfun hpke_decap_export(ge:element, skR:bitstring, l:label) =
   let key = b2k(hkdf_extract(zero,e2b(geR))) in
   (key,export).
 
+(********************************************************)
+(* Signatures and Certificates *)
+(********************************************************)
+type sig_key.
+type verif_key.
+fun vk(sig_key):verif_key.
+fun vk2b(verif_key):bitstring [data].
 
-(********************************************************)
-(* Helper types *)
-(********************************************************)
+fun sign(sig_key,bitstring): bitstring.
+fun verify(verif_key,bitstring,bitstring): bool
+reduc forall sk:sig_key, p:bitstring, sg:bitstring;
+      verify(vk(sk), p, sign(sk,p)) = true.
+
 type domain.
-fun cert(domain): bitstring [data].
+fun privkey(domain):sig_key [private].
+fun cert(domain,verif_key): bitstring [data].
 
 const A: domain.
 const B: domain.
 const F: domain.
+
+
+(* Parametric "sni-independent" processing of sni at the server *)
+letfun get_cert(sni:domain) =
+       cert(sni,vk(privkey(sni))).
+(* Using the following instead would break noninterf of sni
+   because of the comparisons:
+       if sni = A then cert(A)
+       else if sni = B then cert(B)
+       else cert(F).
+*)
+
+letfun validate_cert(d:domain,c:bitstring) =
+       if c = cert(d,vk(privkey(d))) then
+       	  vk(privkey(d)).
+
 
 (********************************************************)
 (* TLS helper types *)
@@ -183,17 +209,6 @@ event ServerRetryReachable().
 
 free io:channel.
 
-(* Parametric "sni-independent" processing of sni at the server *)
-letfun get_cert(sni:domain) = cert(sni).
-(* Using the following instead would break noninterf of sni
-   because of the comparisons:
-       if sni = A then cert(A)
-       else if sni = B then cert(B)
-       else cert(F).
-*)
-
-letfun validate_cert(d:domain,c:bitstring) = c = cert(d).
-
 let ClientECHO(frontend:domain,pkR:element,origin:domain) =
   (* Prepare ECHO Keys *)
   let (ge:element, hpke_key: ae_key, inner_nonce: bitstring) =
@@ -219,14 +234,15 @@ let ClientECHO(frontend:domain,pkR:element,origin:domain) =
 
   (* Handle the SH case first *)
   if msg_type = SH then (
-      let (gy:element,ecert:bitstring) = sh in
+      let (gy:element,ecert:bitstring,esig:bitstring) = sh in
       let gxy_inner = dh_decap(g,gy,x_inner) in
       let k_inner = b2k(hkdf_extract((CH1,SH,ch_inner),e2b(gxy_inner))) in
       let cert_origin = ae_dec(StrongAE,k_inner,ecert) in (
-        event ClientInnerReachable;
-        if validate_cert(origin,cert_origin) then
-          (* ECHO accept with cert match *)
-          event ECHOClientDone(origin,pkR,ch_inner,inner_nonce)
+        let vk_origin = validate_cert(origin,cert_origin) in
+	if verify(vk_origin,(ch_inner,gy,ecert),esig) then (
+        (* ECHO accept with cert match *)
+	  event ClientInnerReachable;
+          event ECHOClientDone(origin,pkR,ch_inner,inner_nonce))
         else (
           (* ECHO accept with cert mismatch -- configuration error *)
           event ClientInnerMismatchReachable;
@@ -236,7 +252,8 @@ let ClientECHO(frontend:domain,pkR:element,origin:domain) =
         let gxy_outer = dh_decap(g,gy,x_outer) in
         let k_outer = b2k(hkdf_extract((CH1,SH,ch_outer),e2b(gxy_outer))) in
         let cert_frontend = ae_dec(StrongAE,k_outer,ecert) in
-        if validate_cert(frontend,cert_frontend) then (
+        let vk_frontend = validate_cert(frontend,cert_frontend) in
+	if verify(vk_frontend,(ch_outer,gy,ecert),esig) then (
           (* ECHO reject *)
 	  event ClientOuterReachable;
           event ECHOClientFallbackDone(frontend,pkR,ch_outer))
@@ -260,28 +277,32 @@ let ServerECHO(frontend:domain,skR:bitstring,should_retry:flag) =
      let (gx_inner:element,origin:domain,=inner_nonce) = ch_inner in
 
      let cert_origin = get_cert(origin) in
+     let sk_origin = privkey(origin) in
 
      event ServerSuccessReachable(ch_inner);
 
      let (gxy_inner:element,gy:element) = dh_encap(g,gx_inner) in
      let k_inner = b2k(hkdf_extract((CH1,SH,ch_inner),e2b(gxy_inner))) in
      let ecert = ae_enc(StrongAE,k_inner,cert_origin) in
+     let sg = sign(sk_origin, (ch_inner, gy, ecert)) in
+     let sh = (gy,ecert,sg) in
 
      event ECHOServerDone(origin,pkR,ch_inner,inner_nonce);
-     let sh = (gy,ecert) in
      out (io,(SH, sh)))
 
     else (
       (* Fallback to public name and CHOuter *)
       let cert_frontend = get_cert(frontend) in
+      let sk_frontend = privkey(frontend) in
 
       let (gxy_outer:element,gy:element) = dh_encap(g,gx_outer) in
       let k_outer = b2k(hkdf_extract((CH1,SH,ch_outer),e2b(gxy_outer))) in
 
       event ServerFallbackReachable(ch_outer);
       let ecert = ae_enc(StrongAE,k_outer,cert_frontend) in
+      let sg = sign(sk_frontend, (ch_outer, gy, ecert)) in
+      let sh = (gy,ecert,sg) in
       event ECHOServerFallbackDone(frontend,pkR,ch_outer);
-      let sh = (gy,ecert) in
       out (io,(SH, sh))))
   else (
     event ServerRetryReachable).
