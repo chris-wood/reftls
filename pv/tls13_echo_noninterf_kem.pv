@@ -1,0 +1,336 @@
+(********************************************************)
+(* ECHO *)
+(********************************************************)
+(* ../../proverif2.00/proverif tls13_echo_noninterf.pv | grep RESULT *)
+
+(* Library Functions and Types *)
+
+const zero: bitstring.
+
+(********************************************************)
+(* Authenticated encryption *)
+(********************************************************)
+
+type ae_alg.
+const StrongAE: ae_alg [data].
+const WeakAE: ae_alg [data].
+
+type ae_key.
+fun b2k(bitstring): ae_key [data].
+
+fun ae_enc_ideal(ae_key,bitstring):bitstring.
+fun ae_dec_ideal(ae_key,bitstring):bitstring
+reduc forall k:ae_key, b:bitstring;
+      ae_dec_ideal(k,ae_enc_ideal(k,b)) = b.
+
+fun ae_enc(ae_alg,ae_key,bitstring): bitstring
+reduc forall a:ae_alg, k:ae_key, p:bitstring;
+      ae_enc(WeakAE, k, p) = p
+otherwise forall a:ae_alg, k:ae_key, p:bitstring;
+      ae_enc(StrongAE, k, p) = ae_enc_ideal(k,p).
+
+fun ae_dec(ae_alg,ae_key,bitstring): bitstring
+reduc forall a:ae_alg, k:ae_key, p:bitstring;
+      ae_dec(WeakAE, k, p) = p
+otherwise forall a:ae_alg, k:ae_key, p:bitstring;
+      ae_dec(StrongAE, k, ae_enc_ideal(k,p)) = p.
+
+(********************************************************)
+(* Diffie-Hellman, modeled as a KEM *)
+(********************************************************)
+
+type group.
+const WeakDH: group [data].
+const StrongDH: group [data].
+
+type element.
+const guessable: element.
+fun e2b(element): bitstring [data].
+
+(* Key Generation *)
+fun dh_pub(group,bitstring): element.
+
+fun discrete_log(element): bitstring
+reduc forall x:bitstring;
+      discrete_log(dh_pub(WeakDH,x)) = x.
+
+letfun dh_keygen(g:group) =
+  new x:bitstring;
+  let gx = dh_pub(g,x) in
+  (x,gx).
+
+(* Encap/Decap Functionality *)
+fun dh_encap_fun(group,element,element):element.
+fun dh_decap_fun(group,element,bitstring): element
+reduc forall g:group, x:bitstring, gxy:element;
+      dh_decap_fun(g,dh_encap_fun(g,dh_pub(g,x),gxy),x) = gxy.
+
+(* Generate then Encap *)
+letfun dh_encap(g:group,gx:element) =
+  new gxy:element;
+  (gxy, dh_encap_fun(g,gx,gxy)).
+
+(* Decap: never fails *)
+letfun dh_decap(g:group,gy:element,x:bitstring) =
+  let gxy = dh_decap_fun(g,gy,x) in
+    gxy
+  else (
+    new gxy:element;
+    gxy).
+
+(********************************************************)
+(* Hash Functions, including those with collisions. See SLOTH *)
+(********************************************************)
+
+type hash_alg.
+const StrongHash: hash_alg [data].
+const WeakHash: hash_alg [data].
+
+const collision:bitstring [data].
+fun hash_ideal(bitstring):bitstring.
+
+fun hash(hash_alg,bitstring): bitstring
+reduc forall x:bitstring;
+      hash(WeakHash,x) = collision
+otherwise forall x:bitstring;
+      hash(StrongHash,x) = hash_ideal(x).
+
+(********************************************************)
+(* HMAC *)
+(********************************************************)
+
+type mac_key.
+fun b2mk(bitstring):mac_key [data,typeConverter].
+
+const forgery:bitstring [data].
+fun hmac_ideal(mac_key,bitstring): bitstring.
+
+fun hmac(hash_alg,mac_key,bitstring):bitstring
+reduc forall k:mac_key, x:bitstring;
+      hmac(WeakHash,k, x) = forgery
+otherwise forall x:bitstring, k:mac_key;
+      hmac(StrongHash,k, x) = hmac_ideal(k,x).
+
+(********************************************************)
+(* HKDF *)
+(********************************************************)
+
+letfun prf(k:bitstring,x:bitstring) =
+       hmac(StrongHash,b2mk(k),x).
+
+letfun hkdf_extract(s:bitstring,k:bitstring) =
+       prf(s,k).
+
+type label.
+const nonce_label, echo_key, echo_iv: label.
+
+letfun hkdf_expand_label(k:bitstring,l:label,h:bitstring) =
+       prf(k,(l,h)).
+
+(********************************************************)
+(* HPKE *)
+(********************************************************)
+
+letfun hpke_encap_export(pkR:element, l:label) =
+  let (geR:element,ge:element) = dh_encap(StrongDH,pkR) in
+  let export = hkdf_expand_label(e2b(geR),l,zero) in
+  let key = b2k(hkdf_extract(zero,e2b(geR))) in
+  (ge,key,export).
+
+letfun hpke_decap_export(ge:element, skR:bitstring, l:label) =
+  let geR = dh_decap(StrongDH,ge,skR) in
+  let export = hkdf_expand_label(e2b(geR),l,zero) in
+  let key = b2k(hkdf_extract(zero,e2b(geR))) in
+  (key,export).
+
+
+(********************************************************)
+(* Helper types *)
+(********************************************************)
+type domain.
+fun cert(domain): bitstring [data].
+
+const A: domain.
+const B: domain.
+const F: domain.
+
+(********************************************************)
+(* TLS helper types *)
+(********************************************************)
+type client_message_type.
+const CH1, CH2: client_message_type.
+type server_message_type.
+const SH: server_message_type.
+
+(********************************************************)
+(* ECHO events *)
+(********************************************************)
+event ECHOClientDone(domain,element,bitstring,bitstring).
+event ECHOServerDone(domain,element,bitstring,bitstring).
+event ECHOClientFallbackDone(domain,element,bitstring).
+event ECHOServerFallbackDone(domain,element,bitstring).
+event ECHOClientAcceptWithMismatch(bitstring,bitstring).
+event ServerFallbackReachable(bitstring).
+event ServerSuccessReachable(bitstring).
+event ClientOuterReachable().
+event ClientInnerUnreachable().
+event ClientInnerReachable().
+event ClientInnerMismatchReachable().
+event ClientOuterUnreachable().
+event ServerRetryReachable().
+
+(* TODO: introduce public parameters and private parameters *)
+
+free io:channel.
+
+(* Parametric "sni-independent" processing of sni at the server *)
+letfun get_cert(sni:domain) = cert(sni).
+(* Using the following instead would break noninterf of sni
+   because of the comparisons:
+       if sni = A then cert(A)
+       else if sni = B then cert(B)
+       else cert(F).
+*)
+
+letfun validate_cert(d:domain,c:bitstring) = c = cert(d).
+
+let ClientECHO(frontend:domain,pkR:element,origin:domain) =
+  (* Prepare ECHO Keys *)
+  let (ge:element, hpke_key: ae_key, inner_nonce: bitstring) =
+      hpke_encap_export(pkR,nonce_label) in
+
+  (* ClientHelloInner *)
+  let g = StrongDH in
+  let (x_inner:bitstring,gx_inner:element) = dh_keygen(g) in
+  let ch_inner = (gx_inner, origin, inner_nonce) in
+
+  (* ECHO *)
+  let echo = ae_enc(StrongAE,hpke_key,ch_inner) in
+
+  (* ClientHelloOuter *)
+  let (x_outer:bitstring,gx_outer:element) = dh_keygen(g) in
+  let ch_outer = (gx_outer, frontend, pkR, ge, echo) in
+
+  (* Send ClientHelloOuter *)
+  out (io,(CH1,ch_outer));
+
+  (* Read a SH (or HRR) from the server *)
+  in (io, (msg_type:server_message_type,sh:bitstring));
+
+  (* Handle the SH case first *)
+  if msg_type = SH then (
+      let (gy:element,ecert:bitstring) = sh in
+      let gxy_inner = dh_decap(g,gy,x_inner) in
+      let k_inner = b2k(hkdf_extract((CH1,SH,ch_inner),e2b(gxy_inner))) in
+      let cert_origin = ae_dec(StrongAE,k_inner,ecert) in (
+        event ClientInnerReachable;
+        if validate_cert(origin,cert_origin) then
+          (* ECHO accept with cert match *)
+          event ECHOClientDone(origin,pkR,ch_inner,inner_nonce)
+        else (
+          (* ECHO accept with cert mismatch -- configuration error *)
+          event ClientInnerMismatchReachable;
+          event ECHOClientAcceptWithMismatch(ch_inner,inner_nonce)))
+      else (
+        (* Otherwise, assume the outer CH was used *)
+        let gxy_outer = dh_decap(g,gy,x_outer) in
+        let k_outer = b2k(hkdf_extract((CH1,SH,ch_outer),e2b(gxy_outer))) in
+        let cert_frontend = ae_dec(StrongAE,k_outer,ecert) in
+        if validate_cert(frontend,cert_frontend) then (
+          (* ECHO reject *)
+	  event ClientOuterReachable;
+          event ECHOClientFallbackDone(frontend,pkR,ch_outer))
+        else (
+          event ClientOuterUnreachable))).
+
+type flag.
+const flag_true, flag_false: flag.
+
+let ServerECHO(frontend:domain,skR:bitstring,should_retry:flag) =
+  in (io,(=CH1,ch_outer:bitstring));
+  let (gx_outer:element,=frontend,target_pk:element,ge:element,echo:bitstring) = ch_outer in
+  if should_retry = flag_false then (
+    let g = StrongDH in
+    let pkR = dh_pub(g,skR) in
+    if target_pk = pkR then (
+     let (hpke_key:ae_key, inner_nonce:bitstring) =
+     	 hpke_decap_export(ge,skR,nonce_label) in
+     let ch_inner = ae_dec(StrongAE,hpke_key,echo) in
+
+     let (gx_inner:element,origin:domain,=inner_nonce) = ch_inner in
+
+     let cert_origin = get_cert(origin) in
+
+     event ServerSuccessReachable(ch_inner);
+
+     let (gxy_inner:element,gy:element) = dh_encap(g,gx_inner) in
+     let k_inner = b2k(hkdf_extract((CH1,SH,ch_inner),e2b(gxy_inner))) in
+     let ecert = ae_enc(StrongAE,k_inner,cert_origin) in
+
+     event ECHOServerDone(origin,pkR,ch_inner,inner_nonce);
+     let sh = (gy,ecert) in
+     out (io,(SH, sh)))
+
+    else (
+      (* Fallback to public name and CHOuter *)
+      let cert_frontend = get_cert(frontend) in
+
+      let (gxy_outer:element,gy:element) = dh_encap(g,gx_outer) in
+      let k_outer = b2k(hkdf_extract((CH1,SH,ch_outer),e2b(gxy_outer))) in
+
+      event ServerFallbackReachable(ch_outer);
+      let ecert = ae_enc(StrongAE,k_outer,cert_frontend) in
+      event ECHOServerFallbackDone(frontend,pkR,ch_outer);
+      let sh = (gy,ecert) in
+      out (io,(SH, sh))))
+  else (
+    event ServerRetryReachable).
+
+(********************************************************)
+(* Queries *)
+(********************************************************)
+
+(* Assert that the protocol completes with sane values *)
+query p:element, n:bitstring, ch_inner:bitstring, ch_outer:bitstring;
+  (* Basic trace reachable events *)
+  event(ClientOuterReachable);
+  event(ClientInnerReachable);
+  event(ServerRetryReachable);
+  event(ClientOuterUnreachable);
+  event(ServerFallbackReachable(ch_outer));
+  event(ServerSuccessReachable(ch_inner));
+
+  (* Basic trace unreachable events *)
+  event(ClientInnerMismatchReachable);
+  event(ECHOClientAcceptWithMismatch(ch_inner,n));
+
+  (* Protocol completion reachable events *)
+  event(ECHOClientDone(chosen_sni,p,ch_inner,n)) ==> event(ECHOServerDone(chosen_sni,p,ch_inner,n));
+  event(ECHOClientFallbackDone(F,p,ch_outer)) ==> event(ECHOServerFallbackDone(F,p,ch_outer));
+
+  event(ECHOClientDone(F,p,ch_inner,n));
+  event(ECHOClientDone(A,p,ch_inner,n));
+  event(ECHOClientDone(B,p,ch_inner,n));
+  event(ECHOClientDone(chosen_sni,p,ch_inner,n));
+  event(ECHOServerDone(F,p,ch_inner,n));
+  event(ECHOServerDone(A,p,ch_inner,n));
+  event(ECHOServerDone(B,p,ch_inner,n));
+  event(ECHOServerDone(chosen_sni,p,ch_inner,n));
+  event(ECHOServerFallbackDone(F,p,ch_outer));
+  event(ECHOClientFallbackDone(F,p,ch_outer)).
+
+(* Main secrecy query *)
+free chosen_sni:domain [private].
+noninterf chosen_sni among (A,B,F).
+
+process
+  let g = StrongDH in
+  let (skF:bitstring,pkF:element) = dh_keygen(g) in
+  let (skA:bitstring,pkA:element) = dh_keygen(g) in
+
+    !ClientECHO(F,pkF,A)
+  | !ClientECHO(F,pkF,B)
+  | !ClientECHO(F,pkF,F)
+  | !ClientECHO(F,pkF,chosen_sni)
+  | !ServerECHO(F,skF,flag_false) (* server with correct key *)
+  | !ServerECHO(F,skA,flag_false) (* server with incorrect key *)
