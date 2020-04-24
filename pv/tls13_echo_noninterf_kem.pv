@@ -207,7 +207,10 @@ event ServerRetryReachable().
 event Compromise(domain).
 
 (* TODO: introduce public parameters and private parameters *)
-
+(*
+letfun allow_hrr_attack() = true.
+letfun enforce_hrr_check() = true.
+*)
 free io:channel.
 
 let ClientECHO(frontend:domain,pkR:element,origin:domain) =
@@ -357,15 +360,17 @@ process
     !ClientECHO(F,pkF,A)
   | !ClientECHO(F,pkF,B)
   | !ClientECHO(F,pkF,F)
-  | !ClientECHO(F,pkF,chosen_sni)
+  | !ClientECHO(F,pkF,chosen_sni) 
   | !ServerECHO(F,skF,flag_false) (* server with correct key *)
 
-  | !ClientECHO(A,pkA,B)	  (* another compromised frontend server *)
+(* another compromised frontend server *)
+  | !ClientECHO(A,pkA,B)
   | !ServerECHO(A,skA,flag_false)
 
-(*
   | (event Compromise(A); out(io,privkey(A)))
   | (event Compromise(B); out(io,privkey(B)))
   | (event Compromise(F); out(io,privkey(F)))
   | (event Compromise(A); out(io,(skA,privkey(A))))
-*)
+(*  | (event Compromise(F); out(io,(skF,privkey(F)))) *) 
+
+
