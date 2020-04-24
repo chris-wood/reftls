@@ -204,6 +204,7 @@ event ClientInnerReachable().
 event ClientInnerMismatchReachable().
 event ClientOuterUnreachable().
 event ServerRetryReachable().
+event Compromise(domain).
 
 (* TODO: introduce public parameters and private parameters *)
 
@@ -238,8 +239,9 @@ let ClientECHO(frontend:domain,pkR:element,origin:domain) =
       let gxy_inner = dh_decap(g,gy,x_inner) in
       let k_inner = b2k(hkdf_extract((CH1,SH,ch_inner),e2b(gxy_inner))) in
       let cert_origin = ae_dec(StrongAE,k_inner,ecert) in (
+        let sig_origin = ae_dec(StrongAE,k_inner,esig) in
         let vk_origin = validate_cert(origin,cert_origin) in
-	if verify(vk_origin,(ch_inner,gy,ecert),esig) then (
+	if verify(vk_origin,(ch_inner,gy,cert_origin),sig_origin) then (
         (* ECHO accept with cert match *)
 	  event ClientInnerReachable;
           event ECHOClientDone(origin,pkR,ch_inner,inner_nonce))
@@ -252,8 +254,9 @@ let ClientECHO(frontend:domain,pkR:element,origin:domain) =
         let gxy_outer = dh_decap(g,gy,x_outer) in
         let k_outer = b2k(hkdf_extract((CH1,SH,ch_outer),e2b(gxy_outer))) in
         let cert_frontend = ae_dec(StrongAE,k_outer,ecert) in
+        let sig_frontend = ae_dec(StrongAE,k_outer,esig) in
         let vk_frontend = validate_cert(frontend,cert_frontend) in
-	if verify(vk_frontend,(ch_outer,gy,ecert),esig) then (
+	if verify(vk_frontend,(ch_outer,gy,cert_frontend),sig_frontend) then (
           (* ECHO reject *)
 	  event ClientOuterReachable;
           event ECHOClientFallbackDone(frontend,pkR,ch_outer))
@@ -276,32 +279,33 @@ let ServerECHO(frontend:domain,skR:bitstring,should_retry:flag) =
 
      let (gx_inner:element,origin:domain,=inner_nonce) = ch_inner in
 
-     let cert_origin = get_cert(origin) in
-     let sk_origin = privkey(origin) in
-
      event ServerSuccessReachable(ch_inner);
 
      let (gxy_inner:element,gy:element) = dh_encap(g,gx_inner) in
+     let cert_origin = get_cert(origin) in
+     let sk_origin = privkey(origin) in
+     let sig_origin = sign(sk_origin, (ch_inner, gy, cert_origin)) in
+
      let k_inner = b2k(hkdf_extract((CH1,SH,ch_inner),e2b(gxy_inner))) in
      let ecert = ae_enc(StrongAE,k_inner,cert_origin) in
-     let sg = sign(sk_origin, (ch_inner, gy, ecert)) in
-     let sh = (gy,ecert,sg) in
+     let esig = ae_enc(StrongAE,k_inner,sig_origin) in
+     let sh = (gy,ecert,esig) in
 
      event ECHOServerDone(origin,pkR,ch_inner,inner_nonce);
      out (io,(SH, sh)))
 
     else (
       (* Fallback to public name and CHOuter *)
+      let (gxy_outer:element,gy:element) = dh_encap(g,gx_outer) in
       let cert_frontend = get_cert(frontend) in
       let sk_frontend = privkey(frontend) in
+      let sig_frontend = sign(sk_frontend, (ch_outer, gy, cert_frontend)) in
 
-      let (gxy_outer:element,gy:element) = dh_encap(g,gx_outer) in
       let k_outer = b2k(hkdf_extract((CH1,SH,ch_outer),e2b(gxy_outer))) in
-
-      event ServerFallbackReachable(ch_outer);
       let ecert = ae_enc(StrongAE,k_outer,cert_frontend) in
-      let sg = sign(sk_frontend, (ch_outer, gy, ecert)) in
-      let sh = (gy,ecert,sg) in
+      let esig = ae_enc(StrongAE,k_outer,sig_frontend) in
+      let sh = (gy,ecert,esig) in
+      event ServerFallbackReachable(ch_outer);
       event ECHOServerFallbackDone(frontend,pkR,ch_outer);
       out (io,(SH, sh))))
   else (
@@ -312,7 +316,7 @@ let ServerECHO(frontend:domain,skR:bitstring,should_retry:flag) =
 (********************************************************)
 
 (* Assert that the protocol completes with sane values *)
-query p:element, n:bitstring, ch_inner:bitstring, ch_outer:bitstring;
+query d:domain, p:element, n:bitstring, ch_inner:bitstring, ch_outer:bitstring;
   (* Basic trace reachable events *)
   event(ClientOuterReachable);
   event(ClientInnerReachable);
@@ -326,6 +330,7 @@ query p:element, n:bitstring, ch_inner:bitstring, ch_outer:bitstring;
   event(ECHOClientAcceptWithMismatch(ch_inner,n));
 
   (* Protocol completion reachable events *)
+  event(ECHOClientDone(d,p,ch_inner,n)) ==> event(ECHOServerDone(d,p,ch_inner,n));
   event(ECHOClientDone(chosen_sni,p,ch_inner,n)) ==> event(ECHOServerDone(chosen_sni,p,ch_inner,n));
   event(ECHOClientFallbackDone(F,p,ch_outer)) ==> event(ECHOServerFallbackDone(F,p,ch_outer));
 
@@ -354,4 +359,13 @@ process
   | !ClientECHO(F,pkF,F)
   | !ClientECHO(F,pkF,chosen_sni)
   | !ServerECHO(F,skF,flag_false) (* server with correct key *)
-  | !ServerECHO(F,skA,flag_false) (* server with incorrect key *)
+
+  | !ClientECHO(A,pkA,B)	  (* another compromised frontend server *)
+  | !ServerECHO(A,skA,flag_false)
+
+(*
+  | (event Compromise(A); out(io,privkey(A)))
+  | (event Compromise(B); out(io,privkey(B)))
+  | (event Compromise(F); out(io,privkey(F)))
+  | (event Compromise(A); out(io,(skA,privkey(A))))
+*)
