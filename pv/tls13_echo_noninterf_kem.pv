@@ -122,7 +122,7 @@ letfun hkdf_extract(s:bitstring,k:bitstring) =
        prf(s,k).
 
 type label.
-const nonce_label, echo_key, echo_iv: label.
+const nonce_label, hrr_key_label, echo_key, echo_iv: label.
 
 letfun hkdf_expand_label(k:bitstring,l:label,h:bitstring) =
        prf(k,(l,h)).
@@ -131,16 +131,30 @@ letfun hkdf_expand_label(k:bitstring,l:label,h:bitstring) =
 (* HPKE *)
 (********************************************************)
 
-letfun hpke_encap_export(pkR:element, l:label) =
+letfun hpke_encap_export(pkR:element, l1:label, l2:label) =
   let (geR:element,ge:element) = dh_encap(StrongDH,pkR) in
-  let export = hkdf_expand_label(e2b(geR),l,zero) in
+  let l1_export = hkdf_expand_label(e2b(geR),l1,zero) in
+  let l2_export = hkdf_expand_label(e2b(geR),l2,zero) in
   let key = b2k(hkdf_extract(zero,e2b(geR))) in
+  (ge,key,l1_export,l2_export).
+
+letfun hpke_encap_psk_export(pkR:element, psk:bitstring, l:label) =
+  let (geR:element,ge:element) = dh_encap(StrongDH,pkR) in
+  let export = hkdf_expand_label(e2b(geR),l,psk) in
+  let key = b2k(hkdf_extract(psk,e2b(geR))) in
   (ge,key,export).
 
-letfun hpke_decap_export(ge:element, skR:bitstring, l:label) =
+letfun hpke_decap_export(ge:element, skR:bitstring, l1:label, l2:label) =
   let geR = dh_decap(StrongDH,ge,skR) in
-  let export = hkdf_expand_label(e2b(geR),l,zero) in
+  let l1_export = hkdf_expand_label(e2b(geR),l1,zero) in
+  let l2_export = hkdf_expand_label(e2b(geR),l2,zero) in
   let key = b2k(hkdf_extract(zero,e2b(geR))) in
+  (key,l1_export,l2_export).
+
+letfun hpke_decap_psk_export(ge:element, skR:bitstring, psk:bitstring, l:label) =
+  let geR = dh_decap(StrongDH,ge,skR) in
+  let export = hkdf_expand_label(e2b(geR),l,psk) in
+  let key = b2k(hkdf_extract(psk,e2b(geR))) in
   (key,export).
 
 (********************************************************)
@@ -186,24 +200,34 @@ letfun validate_cert(d:domain,c:bitstring) =
 type client_message_type.
 const CH1, CH2: client_message_type.
 type server_message_type.
-const SH: server_message_type.
+const SH, HRR: server_message_type.
 
 (********************************************************)
 (* ECHO events *)
 (********************************************************)
 event ECHOClientDone(domain,element,bitstring,bitstring).
+event ECHOClientHRRDone(domain,element,bitstring,bitstring).
 event ECHOServerDone(domain,element,bitstring,bitstring).
+event ECHOServerHRRDone(domain,element,bitstring,bitstring).
 event ECHOClientFallbackDone(domain,element,bitstring).
+event ECHOClientHRRFallbackDone(domain,element,bitstring).
 event ECHOServerFallbackDone(domain,element,bitstring).
 event ECHOClientAcceptWithMismatch(bitstring,bitstring).
+event ECHOClientHRRAcceptWithMismatch(bitstring,bitstring).
 event ServerFallbackReachable(bitstring).
 event ServerSuccessReachable(bitstring).
 event ClientOuterReachable().
 event ClientInnerUnreachable().
+event ClientHRRInnerReachable().
 event ClientInnerReachable().
 event ClientInnerMismatchReachable().
+event ClientHRRInnerMismatchReachable().
 event ClientOuterUnreachable().
+event ClientHRROuterUnreachable().
+event ClientHRROuterReachable().
 event ServerRetryReachable().
+event ClientHRRReachable().
+event ClientSecondHRRReachable().
 event Compromise(domain).
 
 (* TODO: introduce public parameters and private parameters *)
@@ -215,8 +239,8 @@ free io:channel.
 
 let ClientECHO(frontend:domain,pkR:element,origin:domain) =
   (* Prepare ECHO Keys *)
-  let (ge:element, hpke_key: ae_key, inner_nonce: bitstring) =
-      hpke_encap_export(pkR,nonce_label) in
+  let (ge:element, hpke_key: ae_key, inner_nonce: bitstring, hrr_key: bitstring) =
+      hpke_encap_export(pkR,nonce_label,hrr_key_label) in
 
   (* ClientHelloInner *)
   let g = StrongDH in
@@ -238,33 +262,93 @@ let ClientECHO(frontend:domain,pkR:element,origin:domain) =
 
   (* Handle the SH case first *)
   if msg_type = SH then (
+    let (gy:element,ecert:bitstring,esig:bitstring) = sh in
+    let gxy_inner = dh_decap(g,gy,x_inner) in
+    let k_inner = b2k(hkdf_extract((CH1,ch_inner,SH),e2b(gxy_inner))) in
+    let cert_origin = ae_dec(StrongAE,k_inner,ecert) in (
+      let sig_origin = ae_dec(StrongAE,k_inner,esig) in
+      let vk_origin = validate_cert(origin,cert_origin) in
+      if verify(vk_origin,(ch_inner,gy,cert_origin),sig_origin) then (
+        (* ECHO accept with cert match *)
+        event ClientInnerReachable;
+        event ECHOClientDone(origin,pkR,ch_inner,inner_nonce))
+      else (
+        (* ECHO accept with cert mismatch -- configuration error *)
+        event ClientInnerMismatchReachable;
+        event ECHOClientAcceptWithMismatch(ch_inner,inner_nonce)))
+    else (
+      (* Otherwise, assume the outer CH was used *)
+      let gxy_outer = dh_decap(g,gy,x_outer) in
+      let k_outer = b2k(hkdf_extract((CH1,ch_outer,SH),e2b(gxy_outer))) in
+      let cert_frontend = ae_dec(StrongAE,k_outer,ecert) in
+      let sig_frontend = ae_dec(StrongAE,k_outer,esig) in
+      let vk_frontend = validate_cert(frontend,cert_frontend) in
+      if verify(vk_frontend,(ch_outer,gy,cert_frontend),sig_frontend) then (
+        (* ECHO reject *)
+        event ClientOuterReachable;
+        event ECHOClientFallbackDone(frontend,pkR,ch_outer))
+      else (
+        event ClientOuterUnreachable)))
+  else (
+    (* Handle a HRR *)
+    event ClientHRRReachable;
+
+    (* TODO(caw): can we factor out this functionality into a helper function? It generates fresh values for each parameter. *)
+
+    (* Prepare fresh ECHO Keys *)
+    let (ge_2:element, hpke_key_2: ae_key, inner_nonce_2: bitstring) =
+        hpke_encap_psk_export(pkR,hrr_key,nonce_label) in
+
+    (* ClientHelloInner for CH2 *)
+    let (x_inner_2:bitstring,gx_inner_2:element) = dh_keygen(g) in
+    let ch_inner_2 = (gx_inner_2, origin, inner_nonce_2) in
+
+    (* ECHO *)
+    let echo_2 = ae_enc(StrongAE,hpke_key_2,ch_inner_2) in
+
+    (* ClientHelloOuter *)
+    let (x_outer_2:bitstring,gx_outer_2:element) = dh_keygen(g) in
+    let ch_outer_2 = (gx_outer_2, frontend, pkR, ge_2, echo_2) in
+
+    (* Send ClientHelloOuter *)
+    out (io,(CH2,ch_outer_2));
+
+    (* Read a SH from the server *)
+    in (io, (msg_type_2:server_message_type,sh_2:bitstring));
+
+    if msg_type_2 = SH then (
       let (gy:element,ecert:bitstring,esig:bitstring) = sh in
-      let gxy_inner = dh_decap(g,gy,x_inner) in
-      let k_inner = b2k(hkdf_extract((CH1,SH,ch_inner),e2b(gxy_inner))) in
+      let gxy_inner = dh_decap(g,gy,x_inner_2) in
+
+      (* TODO(caw): is this the right transcript for HRR key derivation? *)
+      let k_inner = b2k(hkdf_extract((CH1,ch_inner,HRR,CH2,ch_inner_2,SH),e2b(gxy_inner))) in
       let cert_origin = ae_dec(StrongAE,k_inner,ecert) in (
         let sig_origin = ae_dec(StrongAE,k_inner,esig) in
         let vk_origin = validate_cert(origin,cert_origin) in
-	if verify(vk_origin,(ch_inner,gy,cert_origin),sig_origin) then (
-        (* ECHO accept with cert match *)
-	  event ClientInnerReachable;
-          event ECHOClientDone(origin,pkR,ch_inner,inner_nonce))
+        if verify(vk_origin,(ch_inner_2,gy,cert_origin),sig_origin) then (
+          (* ECHO accept with cert match *)
+          event ClientHRRInnerReachable;
+          event ECHOClientHRRDone(origin,pkR,ch_inner_2,inner_nonce_2))
         else (
           (* ECHO accept with cert mismatch -- configuration error *)
-          event ClientInnerMismatchReachable;
-          event ECHOClientAcceptWithMismatch(ch_inner,inner_nonce)))
+          event ClientHRRInnerMismatchReachable;
+          event ECHOClientHRRAcceptWithMismatch(ch_inner_2,inner_nonce_2)))
       else (
         (* Otherwise, assume the outer CH was used *)
-        let gxy_outer = dh_decap(g,gy,x_outer) in
-        let k_outer = b2k(hkdf_extract((CH1,SH,ch_outer),e2b(gxy_outer))) in
+        let gxy_outer = dh_decap(g,gy,x_outer_2) in
+        let k_outer = b2k(hkdf_extract((CH1,ch_outer,HRR,CH2,ch_outer_2,SH),e2b(gxy_outer))) in
         let cert_frontend = ae_dec(StrongAE,k_outer,ecert) in
         let sig_frontend = ae_dec(StrongAE,k_outer,esig) in
         let vk_frontend = validate_cert(frontend,cert_frontend) in
-	if verify(vk_frontend,(ch_outer,gy,cert_frontend),sig_frontend) then (
+        if verify(vk_frontend,(ch_outer,gy,cert_frontend),sig_frontend) then (
           (* ECHO reject *)
-	  event ClientOuterReachable;
-          event ECHOClientFallbackDone(frontend,pkR,ch_outer))
+          event ClientHRROuterReachable;
+          event ECHOClientHRRFallbackDone(frontend,pkR,ch_outer_2))
         else (
-          event ClientOuterUnreachable))).
+          event ClientHRROuterUnreachable)))
+    else (
+      (* Reaching here means we got two HRRs, which is a protocol violation. Fail silently. *)
+      event ClientSecondHRRReachable)).
 
 type flag.
 const flag_true, flag_false: flag.
@@ -272,47 +356,91 @@ const flag_true, flag_false: flag.
 let ServerECHO(frontend:domain,skR:bitstring,should_retry:flag) =
   in (io,(=CH1,ch_outer:bitstring));
   let (gx_outer:element,=frontend,target_pk:element,ge:element,echo:bitstring) = ch_outer in
-  if should_retry = flag_false then (
-    let g = StrongDH in
-    let pkR = dh_pub(g,skR) in
-    if target_pk = pkR then (
-     let (hpke_key:ae_key, inner_nonce:bitstring) =
-     	 hpke_decap_export(ge,skR,nonce_label) in
-     let ch_inner = ae_dec(StrongAE,hpke_key,echo) in
+  let g = StrongDH in
+  let pkR = dh_pub(g,skR) in
 
-     let (gx_inner:element,origin:domain,=inner_nonce) = ch_inner in
+  (* Check to see if we can process the ECHO extension (do we have the matching key?). *)
+  (* If not, fallback. Otherwise, proceed and do HRR check. *)
+  if target_pk = pkR then (
+    let (hpke_key:ae_key, inner_nonce:bitstring, hrr_binder_key:bitstring) =
+      hpke_decap_export(ge,skR,nonce_label,hrr_key_label) in
 
-     event ServerSuccessReachable(ch_inner);
+      if should_retry = flag_false then (
+        let ch_inner = ae_dec(StrongAE,hpke_key,echo) in
+        let (gx_inner:element,origin:domain,=inner_nonce) = ch_inner in
 
-     let (gxy_inner:element,gy:element) = dh_encap(g,gx_inner) in
-     let cert_origin = get_cert(origin) in
-     let sk_origin = privkey(origin) in
-     let sig_origin = sign(sk_origin, (ch_inner, gy, cert_origin)) in
+        event ServerSuccessReachable(ch_inner);
 
-     let k_inner = b2k(hkdf_extract((CH1,SH,ch_inner),e2b(gxy_inner))) in
-     let ecert = ae_enc(StrongAE,k_inner,cert_origin) in
-     let esig = ae_enc(StrongAE,k_inner,sig_origin) in
-     let sh = (gy,ecert,esig) in
+        let (gxy_inner:element,gy:element) = dh_encap(g,gx_inner) in
+        let cert_origin = get_cert(origin) in
+        let sk_origin = privkey(origin) in
+        let sig_origin = sign(sk_origin, (ch_inner, gy, cert_origin)) in
 
-     event ECHOServerDone(origin,pkR,ch_inner,inner_nonce);
-     out (io,(SH, sh)))
+        let k_inner = b2k(hkdf_extract((CH1,ch_inner,SH),e2b(gxy_inner))) in
+        let ecert = ae_enc(StrongAE,k_inner,cert_origin) in
+        let esig = ae_enc(StrongAE,k_inner,sig_origin) in
+        let sh = (gy,ecert,esig) in
 
-    else (
-      (* Fallback to public name and CHOuter *)
-      let (gxy_outer:element,gy:element) = dh_encap(g,gx_outer) in
-      let cert_frontend = get_cert(frontend) in
-      let sk_frontend = privkey(frontend) in
-      let sig_frontend = sign(sk_frontend, (ch_outer, gy, cert_frontend)) in
+        event ECHOServerDone(origin,pkR,ch_inner,inner_nonce);
+        out (io,(SH, sh)))
+      else (
+        (* Send HRR *)
+        event ServerRetryReachable;
+        out (io,(HRR, zero));
 
-      let k_outer = b2k(hkdf_extract((CH1,SH,ch_outer),e2b(gxy_outer))) in
-      let ecert = ae_enc(StrongAE,k_outer,cert_frontend) in
-      let esig = ae_enc(StrongAE,k_outer,sig_frontend) in
-      let sh = (gy,ecert,esig) in
-      event ServerFallbackReachable(ch_outer);
-      event ECHOServerFallbackDone(frontend,pkR,ch_outer);
-      out (io,(SH, sh))))
+        in (io,(=CH2,ch_outer_2:bitstring));
+        let (gx_outer_2:element,=frontend,target_pk_2:element,ge_2:element,echo_2:bitstring) = ch_outer_2 in
+        let g = StrongDH in
+        let pkR = dh_pub(g,skR) in
+        if target_pk_2 = pkR then (
+          let (hpke_key_2:ae_key, inner_nonce_2:bitstring) =
+            hpke_decap_psk_export(ge_2,skR,hrr_binder_key,nonce_label) in
+          let ch_inner = ae_dec(StrongAE,hpke_key_2,echo_2) in
+
+          let (gx_inner:element,origin:domain,=inner_nonce) = ch_inner in
+
+          event ServerSuccessReachable(ch_inner);
+
+          let (gxy_inner:element,gy:element) = dh_encap(g,gx_inner) in
+          let cert_origin = get_cert(origin) in
+          let sk_origin = privkey(origin) in
+          let sig_origin = sign(sk_origin, (ch_inner, gy, cert_origin)) in
+
+          let k_inner = b2k(hkdf_extract((CH1,ch_inner,HRR,CH2,ch_inner,SH),e2b(gxy_inner))) in
+          let ecert = ae_enc(StrongAE,k_inner,cert_origin) in
+          let esig = ae_enc(StrongAE,k_inner,sig_origin) in
+          let sh = (gy,ecert,esig) in
+
+          event ECHOServerHRRDone(origin,pkR,ch_inner,inner_nonce);
+          out (io,(SH, sh)))
+        else (
+          (* Fallback to public name and CHOuter2 *)
+          let (gxy_outer:element,gy:element) = dh_encap(g,gx_outer_2) in
+          let cert_frontend = get_cert(frontend) in
+          let sk_frontend = privkey(frontend) in
+          let sig_frontend = sign(sk_frontend, (ch_outer, gy, cert_frontend)) in
+
+          let k_outer = b2k(hkdf_extract((CH1,ch_outer,SH),e2b(gxy_outer))) in
+          let ecert = ae_enc(StrongAE,k_outer,cert_frontend) in
+          let esig = ae_enc(StrongAE,k_outer,sig_frontend) in
+          let sh = (gy,ecert,esig) in
+          event ServerFallbackReachable(ch_outer);
+          event ECHOServerFallbackDone(frontend,pkR,ch_outer);
+          out (io,(SH, sh)))))
   else (
-    event ServerRetryReachable).
+    (* Fallback to public name and CHOuter *)
+    let (gxy_outer:element,gy:element) = dh_encap(g,gx_outer) in
+    let cert_frontend = get_cert(frontend) in
+    let sk_frontend = privkey(frontend) in
+    let sig_frontend = sign(sk_frontend, (ch_outer, gy, cert_frontend)) in
+
+    let k_outer = b2k(hkdf_extract((CH1,ch_outer,SH),e2b(gxy_outer))) in
+    let ecert = ae_enc(StrongAE,k_outer,cert_frontend) in
+    let esig = ae_enc(StrongAE,k_outer,sig_frontend) in
+    let sh = (gy,ecert,esig) in
+    event ServerFallbackReachable(ch_outer);
+    event ECHOServerFallbackDone(frontend,pkR,ch_outer);
+    out (io,(SH, sh))).
 
 (********************************************************)
 (* Queries *)
@@ -323,6 +451,8 @@ query d:domain, p:element, n:bitstring, ch_inner:bitstring, ch_outer:bitstring;
   (* Basic trace reachable events *)
   event(ClientOuterReachable);
   event(ClientInnerReachable);
+  event(ClientHRROuterReachable);
+  event(ClientHRRInnerReachable);
   event(ServerRetryReachable);
   event(ClientOuterUnreachable);
   event(ServerFallbackReachable(ch_outer));
@@ -334,17 +464,31 @@ query d:domain, p:element, n:bitstring, ch_inner:bitstring, ch_outer:bitstring;
 
   (* Protocol completion reachable events *)
   event(ECHOClientDone(d,p,ch_inner,n)) ==> event(ECHOServerDone(d,p,ch_inner,n));
+  event(ECHOClientHRRDone(d,p,ch_inner,n)) ==> event(ECHOServerHRRDone(d,p,ch_inner,n));
   event(ECHOClientDone(chosen_sni,p,ch_inner,n)) ==> event(ECHOServerDone(chosen_sni,p,ch_inner,n));
+  event(ECHOClientHRRDone(chosen_sni,p,ch_inner,n)) ==> event(ECHOServerHRRDone(chosen_sni,p,ch_inner,n));
   event(ECHOClientFallbackDone(F,p,ch_outer)) ==> event(ECHOServerFallbackDone(F,p,ch_outer));
 
   event(ECHOClientDone(F,p,ch_inner,n));
   event(ECHOClientDone(A,p,ch_inner,n));
   event(ECHOClientDone(B,p,ch_inner,n));
   event(ECHOClientDone(chosen_sni,p,ch_inner,n));
+
+  event(ECHOClientHRRDone(F,p,ch_inner,n));
+  event(ECHOClientHRRDone(A,p,ch_inner,n));
+  event(ECHOClientHRRDone(B,p,ch_inner,n));
+  event(ECHOClientHRRDone(chosen_sni,p,ch_inner,n));
+
   event(ECHOServerDone(F,p,ch_inner,n));
   event(ECHOServerDone(A,p,ch_inner,n));
   event(ECHOServerDone(B,p,ch_inner,n));
   event(ECHOServerDone(chosen_sni,p,ch_inner,n));
+
+  event(ECHOServerHRRDone(F,p,ch_inner,n));
+  event(ECHOServerHRRDone(A,p,ch_inner,n));
+  event(ECHOServerHRRDone(B,p,ch_inner,n));
+  event(ECHOServerHRRDone(chosen_sni,p,ch_inner,n));
+
   event(ECHOServerFallbackDone(F,p,ch_outer));
   event(ECHOClientFallbackDone(F,p,ch_outer)).
 
@@ -361,9 +505,10 @@ process
   | !ClientECHO(F,pkF,B)
   | !ClientECHO(F,pkF,F)
   | !ClientECHO(F,pkF,chosen_sni) 
-  | !ServerECHO(F,skF,flag_false) (* server with correct key *)
+  | !ServerECHO(F,skF,flag_false) (* server with correct key, which doesn't HRR *)
+  | !ServerECHO(F,skF,flag_true) (* server with correct key, which does HRR *)
 
-(* another compromised frontend server *)
+  (* another compromised frontend server *)
   | !ClientECHO(A,pkA,B)
   | !ServerECHO(A,skA,flag_false)
 
@@ -371,6 +516,6 @@ process
   | (event Compromise(B); out(io,privkey(B)))
   | (event Compromise(F); out(io,privkey(F)))
   | (event Compromise(A); out(io,(skA,privkey(A))))
-(*  | (event Compromise(F); out(io,(skF,privkey(F)))) *) 
+  (*  | (event Compromise(F); out(io,(skF,privkey(F)))) *) 
 
 
