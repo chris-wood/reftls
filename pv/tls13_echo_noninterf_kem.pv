@@ -205,7 +205,7 @@ const SH, HRR: server_message_type.
 (********************************************************)
 (* ECHO events *)
 (********************************************************)
-event ECHOClientDone(domain,element,bitstring,bitstring).
+event ECHOClientDone(domain,domain,element,bitstring).
 event ECHOClientHRRDone(domain,element,bitstring,bitstring).
 event ECHOServerDone(domain,element,bitstring,bitstring).
 event ECHOServerHRRDone(domain,element,bitstring,bitstring).
@@ -237,10 +237,10 @@ letfun enforce_hrr_check() = true.
 *)
 free io:channel.
 
-let ClientECHO(frontend:domain,pkR:element,origin:domain) =
+letfun mkClientHelloEcho(frontend:domain,pk_frontend:element,origin:domain) =
   (* Prepare ECHO Keys *)
   let (ge:element, hpke_key: ae_key, inner_nonce: bitstring, hrr_key: bitstring) =
-      hpke_encap_export(pkR,nonce_label,hrr_key_label) in
+      hpke_encap_export(pk_frontend,nonce_label,hrr_key_label) in
 
   (* ClientHelloInner *)
   let g = StrongDH in
@@ -253,8 +253,21 @@ let ClientECHO(frontend:domain,pkR:element,origin:domain) =
   (* ClientHelloOuter *)
   let (x_outer:bitstring,gx_outer:element) = dh_keygen(g) in
   let ch_outer = (gx_outer, frontend, pkR, ge, echo) in
+  (x_inner,(CH1,ch_inner),x_outer,(CH1,ch_outer)).
 
+letfun procServerHelloEcho(sh:bitstring, d:domain, x:bitstring, tx:bitstring) =
+  let (gy:element,ecert:bitstring,esig:bitstring) = sh in
+  let gxy = dh_decap(g,gy,x) in
+  let k = b2k(hkdf_extract((tx,(SH,gy)),e2b(gxy_inner))) in
+  let cert = ae_dec(StrongAE,k,ecert) in
+  let sig = ae_dec(StrongAE,k,esig) in
+  let vk = validate_cert(d,cert) in
+  if verify(vk,(tx,(gy,cert)),sig) then
+     (tx,(SH,sh)).
+
+let ClientECHO(frontend:domain,pkR:element,origin:domain) =
   (* Send ClientHelloOuter *)
+  let (x_inner,tx_inner,x_outer,tx_outer) = mkClientHelloEcho(frontend,pkR,origin) in
   out (io,(CH1,ch_outer));
 
   (* Read a SH (or HRR) from the server *)
@@ -262,17 +275,11 @@ let ClientECHO(frontend:domain,pkR:element,origin:domain) =
 
   (* Handle the SH case first *)
   if msg_type = SH then (
-    let (gy:element,ecert:bitstring,esig:bitstring) = sh in
-    let gxy_inner = dh_decap(g,gy,x_inner) in
-    let k_inner = b2k(hkdf_extract((CH1,ch_inner,SH),e2b(gxy_inner))) in
-    let cert_origin = ae_dec(StrongAE,k_inner,ecert) in (
-      let sig_origin = ae_dec(StrongAE,k_inner,esig) in
-      let vk_origin = validate_cert(origin,cert_origin) in
-      if verify(vk_origin,(ch_inner,gy,cert_origin),sig_origin) then (
+    let tx_inner_sh = procServerHelloEcho(sh, origin, x_inner, tx_inner) in
         (* ECHO accept with cert match *)
-        event ClientInnerReachable;
-        event ECHOClientDone(origin,pkR,ch_inner,inner_nonce))
-      else (
+        event ECHOClientDone(frontend,origin,pkR,tx_inner_sh)
+    else
+    let tx_outer_sh = procServerHelloEcho(sh, frontend, x_outer, tx_outer) in
         (* ECHO accept with cert mismatch -- configuration error *)
         event ClientInnerMismatchReachable;
         event ECHOClientAcceptWithMismatch(ch_inner,inner_nonce)))
@@ -512,10 +519,10 @@ process
   | !ClientECHO(A,pkA,B)
   | !ServerECHO(A,skA,flag_false)
 
-  | (event Compromise(A); out(io,privkey(A)))
+(*  | (event Compromise(A); out(io,privkey(A)))
   | (event Compromise(B); out(io,privkey(B)))
   | (event Compromise(F); out(io,privkey(F)))
-  | (event Compromise(A); out(io,(skA,privkey(A))))
+  | (event Compromise(A); out(io,(skA,privkey(A)))) *)
   (*  | (event Compromise(F); out(io,(skF,privkey(F)))) *) 
 
 

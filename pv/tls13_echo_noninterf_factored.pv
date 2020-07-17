@@ -209,6 +209,10 @@ event ECHOClientDone(domain,domain,element,ae_key,bitstring).
 event ECHOServerDone(domain,domain,element,ae_key,bitstring).
 event ECHOClientFallbackDone(domain,element,ae_key,bitstring).
 event ECHOServerFallbackDone(domain,element,ae_key,bitstring).
+event ECHOClient2Done(domain,domain,element,ae_key,bitstring).
+event ECHOServer2Done(domain,domain,element,ae_key,bitstring).
+event ECHOClientFallback2Done(domain,element,ae_key,bitstring).
+event ECHOServerFallback2Done(domain,element,ae_key,bitstring).
 event Compromise(domain).
 
 free io:channel.
@@ -252,7 +256,7 @@ letfun mkServerHelloEcho(ch_outer:bitstring, frontend:domain, dk_frontend:bitstr
       hpke_decap_export(ge,dk_frontend,nonce_label,hrr_key_label) in
     let ch_inner = ae_dec(StrongAE,hpke_key,echo) in
     let tx_inner = (CH1,ch_inner) in
-    let (gx_inner:element,origin:domain,=inner_nonce) = ch_inner in
+    let (gx_inner:element,9origin:domain,=inner_nonce) = ch_inner in
     let (gxy_inner:element,gy:element) = dh_encap(g,gx_inner) in
     let cert_origin = get_cert(origin) in
     let sk_origin = privkey(origin) in
@@ -282,10 +286,10 @@ letfun procServerHelloEcho(sh:bitstring, d:domain, x:bitstring, tx:bitstring) =
   let (gy:element,ecert:bitstring,esig:bitstring) = sh in
   let gxy = dh_decap(g,gy,x) in
   let k = b2k(hkdf_extract((tx,(SH,gy)),e2b(gxy))) in
-    let cert = ae_dec(StrongAE,k,ecert) in
+  let scert = ae_dec(StrongAE,k,ecert) in
   let sig = ae_dec(StrongAE,k,esig) in
-  let vk = validate_cert(d,cert) in
-  if verify(vk,(tx,(SH,gy,cert)),sig) then
+  let vk_s = validate_cert(d,scert) in
+  if verify(vk_s,(tx,(SH,gy,scert)),sig) then
      cfResult(k,(tx,(SH,sh))).
 
 let ClientECHO(frontend:domain,pk_frontend:element,origin:domain) =
@@ -303,8 +307,22 @@ let ClientECHO(frontend:domain,pk_frontend:element,origin:domain) =
         (* ECHO accept with cert match *)
         event ECHOClientDone(frontend,origin,pk_frontend,k,tx_inner_sh)
     else (
-    let cfResult(k,tx_outer_sh) = procServerHelloEcho(sh, frontend, x_outer, tx_outer) in
-        event ECHOClientFallbackDone(frontend,pk_frontend,k,tx_outer_sh))).
+        let cfResult(k,tx_outer_sh) = procServerHelloEcho(sh, frontend, x_outer, tx_outer) in
+        event ECHOClientFallbackDone(frontend,pk_frontend,k,tx_outer_sh)))
+  else if msg_type = HRR then (
+    let tx = ((CH1,ch_outer),(HRR,())) in
+    let chResult(ch_outer',x_inner',tx_inner',x_outer',tx_outer') =
+        mkClientHelloEcho(frontend,pk_frontend,origin) in
+    out (io,(CH2,ch_outer'));
+    (* Read a SH from the server *)
+    in (io, (=SH,sh:bitstring));
+    let cfResult(k,tx_inner_sh) = procServerHelloEcho(sh, origin, x_inner', (tx,tx_inner')) in
+    (* ECHO accept with cert match *)
+    event ECHOClient2Done(frontend,origin,pk_frontend,k,tx_inner_sh)
+    else (
+        let cfResult(k,tx_outer_sh) = procServerHelloEcho(sh, frontend, x_outer', (tx,tx_outer')) in
+        event ECHOClientFallback2Done(frontend,pk_frontend,k,tx_outer_sh))
+  ).
 
 type flag.
 const flag_true, flag_false: flag.
@@ -314,14 +332,30 @@ let ServerECHO(frontend:domain,dk_frontend:bitstring,should_retry:flag) =
   let (gx_outer:element,=frontend,target_pk:element,ge:element,echo:bitstring) = ch_outer in
   let g = StrongDH in
   let pk_frontend = dh_pub(g,dk_frontend) in
-
-  let shInnerResult(sh,origin,k,tx) = mkServerHelloEcho(ch_outer,frontend,dk_frontend) in (
+  let sh = mkServerHelloEcho(ch_outer,frontend,dk_frontend) in
+  if should_retry = flag_false then (
+     let shInnerResult(sh,origin,k,tx) = sh in (
      event ECHOServerDone(frontend,origin,pk_frontend,k,tx);
      out (io,(SH, sh)))
-  else
-  let shOuterResult(sh,k,tx) = mkServerHelloEcho(ch_outer,frontend,dk_frontend) in (
+     else
+     let shOuterResult(sh,k,tx) = sh in (
      event ECHOServerFallbackDone(frontend,pk_frontend,k,tx);
-     out (io,(SH, sh))).
+     out (io,(SH, sh))))
+  else (
+     out (io, (HRR,()));
+     let tx = ((CH1,ch_outer),(HRR,())) in
+     in (io,(=CH2,ch_outer:bitstring));
+     let (gx_outer:element,=frontend,target_pk:element,ge:element,echo:bitstring) = ch_outer in
+     let g = StrongDH in
+     let pk_frontend = dh_pub(g,dk_frontend) in
+     let sh = mkServerHelloEcho(ch_outer,frontend,dk_frontend) in
+     let shInnerResult(sh,origin,k,tx') = sh in (
+       event ECHOServer2Done(frontend,origin,pk_frontend,k,(tx,tx'));
+       out (io,(SH, sh)))
+     else
+       let shOuterResult(sh,k,tx') = sh in (
+       event ECHOServerFallback2Done(frontend,pk_frontend,k,(tx,tx'));
+       out (io,(SH, sh)))).
 
 (********************************************************)
 (* Queries *)
@@ -346,11 +380,30 @@ query f:domain, o:domain, p:element, tx:bitstring, k:ae_key;
   event(ECHOServerDone(A,o,p,k,tx));
 (*  event(ECHOServerDone(B,o,p,k,tx)); *)
 
+  event(ECHOClient2Done(F,A,p,k,tx));
+  event(ECHOClient2Done(F,B,p,k,tx));
+  event(ECHOClient2Done(F,chosen_sni,p,k,tx));
+  event(ECHOClient2Done(A,o,p,k,tx));
+(*  event(ECHOClientDone(B,o,p,k,tx)); *)
+
+  event(ECHOServer2Done(F,A,p,k,tx));
+  event(ECHOServer2Done(F,B,p,k,tx));
+  event(ECHOServer2Done(F,chosen_sni,p,k,tx));
+  event(ECHOServer2Done(A,o,p,k,tx));
+(*  event(ECHOServerDone(B,o,p,k,tx)); *)
+
   event(ECHOClientFallbackDone(f,p,k,tx));
   event(ECHOClientFallbackDone(F,p,k,tx));
   event(ECHOClientFallbackDone(A,p,k,tx));
   event(ECHOServerFallbackDone(F,p,k,tx));
-  event(ECHOServerFallbackDone(A,p,k,tx)).
+  event(ECHOServerFallbackDone(A,p,k,tx));
+
+  event(ECHOClientFallback2Done(f,p,k,tx));
+  event(ECHOClientFallback2Done(F,p,k,tx));
+  event(ECHOClientFallback2Done(A,p,k,tx));
+  event(ECHOServerFallback2Done(F,p,k,tx));
+  event(ECHOServerFallback2Done(A,p,k,tx)).
+
 
 (* Main secrecy query *)
 free chosen_sni:domain [private].
@@ -364,7 +417,7 @@ process
     !ClientECHO(F,pkF,A)
   | !ClientECHO(F,pkF,B)
   | !ClientECHO(F,pkF,F)
-  | !ClientECHO(F,pkF,chosen_sni) 
+  | !ClientECHO(F,pkF,chosen_sni)
   | !ServerECHO(F,skF,flag_false) (* server with correct key, which doesn't HRR *)
   | !ServerECHO(F,skF,flag_true) (* server with correct key, which does HRR *)
 
