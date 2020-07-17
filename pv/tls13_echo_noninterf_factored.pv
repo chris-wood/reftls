@@ -205,6 +205,7 @@ const SH, HRR: server_message_type.
 (********************************************************)
 (* ECHO events *)
 (********************************************************)
+event Reachable().
 event ECHOClientDone(domain,domain,element,ae_key,bitstring).
 event ECHOServerDone(domain,domain,element,ae_key,bitstring).
 event ECHOClientFallbackDone(domain,element,ae_key,bitstring).
@@ -256,7 +257,7 @@ letfun mkServerHelloEcho(ch_outer:bitstring, frontend:domain, dk_frontend:bitstr
       hpke_decap_export(ge,dk_frontend,nonce_label,hrr_key_label) in
     let ch_inner = ae_dec(StrongAE,hpke_key,echo) in
     let tx_inner = (CH1,ch_inner) in
-    let (gx_inner:element,9origin:domain,=inner_nonce) = ch_inner in
+    let (gx_inner:element,origin:domain,=inner_nonce) = ch_inner in
     let (gxy_inner:element,gy:element) = dh_encap(g,gx_inner) in
     let cert_origin = get_cert(origin) in
     let sk_origin = privkey(origin) in
@@ -316,9 +317,10 @@ let ClientECHO(frontend:domain,pk_frontend:element,origin:domain) =
     out (io,(CH2,ch_outer'));
     (* Read a SH from the server *)
     in (io, (=SH,sh:bitstring));
-    let cfResult(k,tx_inner_sh) = procServerHelloEcho(sh, origin, x_inner', (tx,tx_inner')) in
+    let cfResult(k,tx_inner_sh) = procServerHelloEcho(sh, origin, x_inner', (tx,tx_inner')) in (
+    event Reachable();
     (* ECHO accept with cert match *)
-    event ECHOClient2Done(frontend,origin,pk_frontend,k,tx_inner_sh)
+    event ECHOClient2Done(frontend,origin,pk_frontend,k,tx_inner_sh))
     else (
         let cfResult(k,tx_outer_sh) = procServerHelloEcho(sh, frontend, x_outer', (tx,tx_outer')) in
         event ECHOClientFallback2Done(frontend,pk_frontend,k,tx_outer_sh))
@@ -363,6 +365,7 @@ let ServerECHO(frontend:domain,dk_frontend:bitstring,should_retry:flag) =
 
 (* Assert that the protocol completes with sane values *)
 query f:domain, o:domain, p:element, tx:bitstring, k:ae_key;
+  event(Reachable());
   (* Protocol completion reachable events *)
   event(ECHOClientDone(f,o,p,k,tx)) ==> event(ECHOServerDone(f,o,p,k,tx));
   event(ECHOClientDone(f,chosen_sni,p,k,tx)) ==> event(ECHOServerDone(f,chosen_sni,p,k,tx));
