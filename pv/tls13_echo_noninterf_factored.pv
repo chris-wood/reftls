@@ -272,7 +272,7 @@ letfun mkServerHelloEcho(ch_outer:bitstring, frontend:domain, dk_frontend:bitstr
     let (gxy_outer:element,gy:element) = dh_encap(g,gx_outer) in
     let tx_outer = (tx_in,(CH,ch_outer)) in
     let k_outer = b2k(hkdf_extract((tx_outer,(SH,gy)),e2b(gxy_outer))) in
-    let cert_frontend = get_cert(frontend) in
+        let cert_frontend = get_cert(frontend) in
     let sk_frontend = privkey(frontend) in
     let sig_frontend = sign(sk_frontend, (tx_outer,(SH,gy,cert_frontend))) in
     let ecert = ae_enc(StrongAE,k_outer,cert_frontend) in
@@ -294,7 +294,7 @@ letfun procServerHelloEcho(sh:bitstring, d:domain, x:bitstring, tx:bitstring) =
      cfResult(k,(tx,(SH,sh))).
 
 let ClientECHO(frontend:domain,pk_frontend:element,origin:domain) =
-  (* Send ClientHelloOuter *)
+  (* Compute ClientHello1: tx = () *)
   let chResult(ch_outer,x_inner,tx_inner,x_outer,tx_outer) =
       mkClientHelloEcho(frontend,pk_frontend,origin,()) in
   out (io,(CH,ch_outer));
@@ -311,7 +311,8 @@ let ClientECHO(frontend:domain,pk_frontend:element,origin:domain) =
         let cfResult(k,tx_outer_sh) = procServerHelloEcho(msg, frontend, x_outer, tx_outer) in
         event ECHOClientFallbackDone(frontend,pk_frontend,k,tx_outer_sh)))
   else if msg_type = HRR then (
-    let tx = (((),(CH,ch_outer)),(HRR,())) in
+    (* Compute tx after HRR *)
+    let tx = (tx_outer,(HRR,())) in
     let chResult(ch_outer',x_inner',tx_inner',x_outer',tx_outer') =
         mkClientHelloEcho(frontend,pk_frontend,origin,tx) in
     out (io,(CH,ch_outer'));
@@ -325,15 +326,10 @@ let ClientECHO(frontend:domain,pk_frontend:element,origin:domain) =
         event ECHOClientFallback2Done(frontend,pk_frontend,k,tx_outer_sh))
   ).
 
-type flag.
-const flag_true, flag_false: flag.
-
-let ServerECHO(frontend:domain,dk_frontend:bitstring,should_retry:flag) =
+let ServerECHO(frontend:domain,dk_frontend:bitstring,should_retry:bool) =
+  let pk_frontend = dh_pub(StrongDH,dk_frontend) in
   in (io,(=CH,ch_outer:bitstring));
-  let (gx_outer:element,=frontend,target_pk:element,ge:element,echo:bitstring) = ch_outer in
-  let g = StrongDH in
-  let pk_frontend = dh_pub(g,dk_frontend) in
-  if should_retry = flag_false then (
+  if should_retry = false then (
      let sh_msg = mkServerHelloEcho(ch_outer,frontend,dk_frontend,()) in
      let shInnerResult(sh,origin,k,tx) = sh_msg in (
      event ECHOServerDone(frontend,origin,pk_frontend,k,tx);
@@ -346,7 +342,6 @@ let ServerECHO(frontend:domain,dk_frontend:bitstring,should_retry:flag) =
      out (io, (HRR,()));
      let tx = (((),(CH,ch_outer)),(HRR,())) in
      in (io,(=CH,ch_outer':bitstring));
-     let (gx_outer':element,=frontend,target_pk':element,ge':element,echo':bitstring) = ch_outer' in
      let sh_msg = mkServerHelloEcho(ch_outer',frontend,dk_frontend,tx) in
      let shInnerResult(sh,origin,k,tx') = sh_msg in (
        event ECHOServer2Done(frontend,origin,pk_frontend,k,tx');
@@ -360,7 +355,7 @@ let ServerECHO(frontend:domain,dk_frontend:bitstring,should_retry:flag) =
 (* Queries *)
 (********************************************************)
 
-(* query event(Reachable()). *)
+query event(Reachable()).
 
 (* Assert that the protocol completes with sane values *)
 query f:domain, o:domain, p:element, tx:bitstring, k:ae_key;
@@ -417,15 +412,17 @@ process
   let (skA:bitstring,pkA:element) = dh_keygen(g) in
 
     !ClientECHO(F,pkF,A)
+(*  | !ClientECHO(F,pkA,A) *)
   | !ClientECHO(F,pkF,B)
   | !ClientECHO(F,pkF,F)
   | !ClientECHO(F,pkF,chosen_sni)
-  | !ServerECHO(F,skF,flag_false)
-  | !ServerECHO(F,skF,flag_true) 
+  | !ServerECHO(F,skF,false)
+  | !ServerECHO(F,skF,true)
 
   (* another compromised frontend server *)
   | !ClientECHO(A,pkA,B)
-  | !ServerECHO(A,skA,flag_false)
+  | !ServerECHO(A,skA,false)
+  | !ServerECHO(A,skA,true)
 
 (*  | (event Compromise(A); out(io,privkey(A)))
   | (event Compromise(B); out(io,privkey(B)))
